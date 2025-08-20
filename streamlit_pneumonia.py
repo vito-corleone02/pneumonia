@@ -32,7 +32,8 @@ from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
 from keras.preprocessing import image
-from keras.preprocessing.image import ImageDataGenerator
+# from keras.preprocessing.image import ImageDataGenerator
+from keras.src.legacy.preprocessing.image import ImageDataGenerator
 
 from textblob import TextBlob
 
@@ -883,3 +884,4 @@ st.markdown(
     - Advanced visualizations: sentiment distributions, misinformation rates, and simulation trends
     """
 )
+
