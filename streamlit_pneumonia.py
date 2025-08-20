@@ -17,15 +17,22 @@ import os
 import re
 from PIL import Image
 from urllib.parse import quote_plus
+import pickle
+from datetime import datetime
+
+# Resolve default dataset directories relative to this script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_TRAIN_DIR = os.path.join(SCRIPT_DIR, "train")
+DEFAULT_VAL_DIR = os.path.join(SCRIPT_DIR, "val")
+DEFAULT_TEST_DIR = os.path.join(SCRIPT_DIR, "test")
+MODELS_DIR = os.path.join(SCRIPT_DIR, "saved_models")
 
 from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
 from keras.preprocessing import image
-# from keras.preprocessing.image import ImageDataGenerator
-from keras.src.legacy.preprocessing.image import ImageDataGenerator
-
+from keras.preprocessing.image import ImageDataGenerator
 
 from textblob import TextBlob
 
@@ -33,16 +40,19 @@ from mesa import Agent, Model
 from mesa.time import RandomActivation
 from mesa.space import MultiGrid
 from mesa.datacollection import DataCollector
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 
 # =======================
 # 1) MODEL TRAINING (from v06, with persistence via session_state)
 # =======================
 
 @st.cache_resource
-def train_models(train_dir, valid_dir, img_size=(64, 64), batch_size=32):
+def train_models(train_dir, valid_dir, test_dir, img_size=(64, 64), batch_size=32):
     # ImageDataGenerators for train and validation
     train_datagen = ImageDataGenerator(rescale=1./255)
     valid_datagen = ImageDataGenerator(rescale=1./255)
+    test_datagen = ImageDataGenerator(rescale=1./255)
 
     train_generator = train_datagen.flow_from_directory(
         train_dir, target_size=img_size, batch_size=batch_size,
@@ -50,6 +60,10 @@ def train_models(train_dir, valid_dir, img_size=(64, 64), batch_size=32):
     )
     valid_generator = valid_datagen.flow_from_directory(
         valid_dir, target_size=img_size, batch_size=batch_size,
+        class_mode='binary', shuffle=False
+    )
+    test_generator = test_datagen.flow_from_directory(
+        test_dir, target_size=img_size, batch_size=batch_size,
         class_mode='binary', shuffle=False
     )
 
@@ -64,34 +78,61 @@ def train_models(train_dir, valid_dir, img_size=(64, 64), batch_size=32):
 
     X_train, y_train = generator_to_xy(train_generator)
     X_valid, y_valid = generator_to_xy(valid_generator)
+    X_test, y_test = generator_to_xy(test_generator)
 
     # Flatten images for Logistic Regression & XGBoost
     X_train_flat = X_train.reshape(X_train.shape[0], -1)
     X_valid_flat = X_valid.reshape(X_valid.shape[0], -1)
+    X_test_flat = X_test.reshape(X_test.shape[0], -1)
 
     # Train Logistic Regression
     log_reg = LogisticRegression(max_iter=1000)
     log_reg.fit(X_train_flat, y_train)
-    y_pred_log = log_reg.predict(X_valid_flat)
-    acc_log = accuracy_score(y_valid, y_pred_log)
-    cm_log = confusion_matrix(y_valid, y_pred_log)
-    cr_log = classification_report(y_valid, y_pred_log, output_dict=False)
+    y_pred_log_val = log_reg.predict(X_valid_flat)
+    acc_log = accuracy_score(y_valid, y_pred_log_val)
+    cm_log = confusion_matrix(y_valid, y_pred_log_val)
+    cr_log = classification_report(y_valid, y_pred_log_val, output_dict=False)
+    # Test metrics
+    y_pred_log_test = log_reg.predict(X_test_flat)
+    acc_log_test = accuracy_score(y_test, y_pred_log_test)
+    cm_log_test = confusion_matrix(y_test, y_pred_log_test)
+    cr_log_test = classification_report(y_test, y_pred_log_test, output_dict=False)
 
     # Train XGBoost
     xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss')
     xgb.fit(X_train_flat, y_train)
-    y_pred_xgb = xgb.predict(X_valid_flat)
-    acc_xgb = accuracy_score(y_valid, y_pred_xgb)
-    cm_xgb = confusion_matrix(y_valid, y_pred_xgb)
-    cr_xgb = classification_report(y_valid, y_pred_xgb, output_dict=False)
+    y_pred_xgb_val = xgb.predict(X_valid_flat)
+    acc_xgb = accuracy_score(y_valid, y_pred_xgb_val)
+    cm_xgb = confusion_matrix(y_valid, y_pred_xgb_val)
+    cr_xgb = classification_report(y_valid, y_pred_xgb_val, output_dict=False)
+    # Test metrics
+    y_pred_xgb_test = xgb.predict(X_test_flat)
+    acc_xgb_test = accuracy_score(y_test, y_pred_xgb_test)
+    cm_xgb_test = confusion_matrix(y_test, y_pred_xgb_test)
+    cr_xgb_test = classification_report(y_test, y_pred_xgb_test, output_dict=False)
 
     return {
         "log_reg": log_reg,
         "xgb": xgb,
         "val_data": (X_valid_flat, y_valid),
+        "test_data": (X_test_flat, y_test),
         "metrics": {
-            "log_reg": {"accuracy": acc_log, "conf_matrix": cm_log, "class_report": cr_log},
-            "xgb": {"accuracy": acc_xgb, "conf_matrix": cm_xgb, "class_report": cr_xgb}
+            "log_reg": {
+                "accuracy": acc_log,
+                "conf_matrix": cm_log,
+                "class_report": cr_log,
+                "test_accuracy": acc_log_test,
+                "test_conf_matrix": cm_log_test,
+                "test_class_report": cr_log_test
+            },
+            "xgb": {
+                "accuracy": acc_xgb,
+                "conf_matrix": cm_xgb,
+                "class_report": cr_xgb,
+                "test_accuracy": acc_xgb_test,
+                "test_conf_matrix": cm_xgb_test,
+                "test_class_report": cr_xgb_test
+            }
         }
     }
 
@@ -248,6 +289,7 @@ def get_data_source_info(source):
         "Tavily Web Search": "Comprehensive web search results",
         "Wikipedia (Free)": "Academic and factual information",
         "Hacker News (Free)": "Tech community discussions and news",
+        "HealthVer (local CSV)": "Health verification CSVs in local 'data' folder",
         "HealthVer (local JSON)": "Health verification dataset",
         "FullFact (local JSON)": "Fact-checking dataset"
     }
@@ -348,8 +390,21 @@ st.markdown("""
 
 # Sidebar — dataset & training controls (from v06)
 st.sidebar.header("Dataset & Model Training")
-train_dir = st.sidebar.text_input("Training Images Folder (local path)", "")
-valid_dir = st.sidebar.text_input("Validation Images Folder (local path)", "")
+train_dir = st.sidebar.text_input(
+    "Training Images Folder (local path)",
+    DEFAULT_TRAIN_DIR,
+    help="Folder containing 'NORMAL' and 'PNEUMONIA' subfolders (e.g., train)"
+)
+valid_dir = st.sidebar.text_input(
+    "Validation Images Folder (local path)",
+    DEFAULT_VAL_DIR,
+    help="Folder containing 'NORMAL' and 'PNEUMONIA' subfolders (e.g., val)"
+)
+test_dir = st.sidebar.text_input(
+    "Test Images Folder (local path)",
+    DEFAULT_TEST_DIR,
+    help="Folder containing 'NORMAL' and 'PNEUMONIA' subfolders (e.g., test)"
+)
 train_button = st.sidebar.button("Train Models on Dataset")
 
 # API Keys (optional)
@@ -358,7 +413,7 @@ tavily_api_key = st.sidebar.text_input("Tavily API Key (optional)", type="passwo
 # Data source selection
 dataset_source = st.sidebar.selectbox(
     "Misinformation Source Dataset",
-    ["Reddit (Free API)", "Tavily Web Search", "Wikipedia (Free)", "Hacker News (Free)", "HealthVer (local JSON)", "FullFact (local JSON)"]
+    ["Reddit (Free API)", "Tavily Web Search", "Wikipedia (Free)", "Hacker News (Free)", "HealthVer (local CSV)", "HealthVer (local JSON)", "FullFact (local JSON)"]
 )
 
 # Search configuration
@@ -401,28 +456,119 @@ num_clinicians = st.sidebar.slider("Number of Clinician Agents", 1, 10, 3)
 misinfo_exposure = st.sidebar.slider("Baseline Misinformation Exposure", 0.0, 1.0, 0.5, 0.05)
 simulate_button = st.sidebar.button("Run Agent-Based Simulation")
 
+# ===============================
+# 6. HealthVer Dataset Evaluation
+# ===============================
+st.markdown("## 📊 HealthVer Benchmark Evaluation")
+
+@st.cache_data
+def load_healthver_data():
+    # train_df = pd.read_csv("data/healthver_train.csv", sep="\t")
+    # dev_df = pd.read_csv("data/healthver_dev.csv", sep="\t")
+    # test_df = pd.read_csv("data/healthver_test.csv", sep="\t")
+    
+    train_df = pd.read_csv("data/healthver_train.csv", sep=None, engine="python")
+    dev_df = pd.read_csv("data/healthver_dev.csv", sep=None, engine="python")
+    test_df = pd.read_csv("data/healthver_test.csv", sep=None, engine="python")
+    return train_df, dev_df, test_df
+
+try:
+    train_df, dev_df, test_df = load_healthver_data()
+
+    # Encode labels
+    label_map = {"Supports": 0, "Refutes": 1, "Neutral": 2}
+    train_df["label_enc"] = train_df["label"].map(label_map)
+    dev_df["label_enc"] = dev_df["label"].map(label_map)
+    test_df["label_enc"] = test_df["label"].map(label_map)
+
+    # Feature: evidence + claim concatenation
+    def combine_text(df):
+        return (df["evidence"].fillna("") + " " + df["claim"].fillna("")).values
+
+    X_train_text = combine_text(train_df)
+    y_train = train_df["label_enc"].values
+    X_dev_text = combine_text(dev_df)
+    y_dev = dev_df["label_enc"].values
+    X_test_text = combine_text(test_df)
+    y_test = test_df["label_enc"].values
+
+    # Vectorize text
+    vectorizer = TfidfVectorizer(max_features=5000, stop_words="english")
+    X_train = vectorizer.fit_transform(X_train_text)
+    X_dev = vectorizer.transform(X_dev_text)
+    X_test = vectorizer.transform(X_test_text)
+
+    # Train Logistic Regression (baseline)
+    clf = LogisticRegression(max_iter=300)
+    clf.fit(X_train, y_train)
+
+    # Evaluate
+    y_dev_pred = clf.predict(X_dev)
+    y_test_pred = clf.predict(X_test)
+
+    dev_acc = accuracy_score(y_dev, y_dev_pred)
+    test_acc = accuracy_score(y_test, y_test_pred)
+
+    st.markdown(f"**✅ Dev Accuracy:** {dev_acc:.3f}")
+    st.markdown(f"**✅ Test Accuracy:** {test_acc:.3f}")
+
+    # Classification Report
+    st.text("Classification Report (Test Set):")
+    st.text(classification_report(y_test, y_test_pred, target_names=label_map.keys()))
+
+except Exception as e:
+    st.error(f"⚠️ Could not evaluate HealthVer dataset: {e}")
+
+
 # =======================
 # TRAIN MODELS (from v06; now persisted)
 # =======================
 
 if train_button:
-    if train_dir and valid_dir and os.path.exists(train_dir) and os.path.exists(valid_dir):
+    if (
+        train_dir and valid_dir and test_dir and
+        os.path.exists(train_dir) and os.path.exists(valid_dir) and os.path.exists(test_dir)
+    ):
         with st.spinner("Training models on your dataset..."):
-            model_data = train_models(train_dir, valid_dir)
+            model_data = train_models(train_dir, valid_dir, test_dir)
             st.session_state["model_data"] = model_data
             st.session_state.model_trained = True
         st.success("Models trained!")
+
+        # Save trained models
+        try:
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(MODELS_DIR, f"log_reg_{timestamp}.pkl")
+            xgb_path = os.path.join(MODELS_DIR, f"xgb_{timestamp}.pkl")
+            with open(log_path, "wb") as f:
+                pickle.dump(model_data['log_reg'], f)
+            with open(xgb_path, "wb") as f:
+                pickle.dump(model_data['xgb'], f)
+            st.info(f"💾 Saved models to:\n- {log_path}\n- {xgb_path}")
+        except Exception as e:
+            st.warning(f"Could not save models: {e}")
 
         # Show evaluation results
         st.write("### Validation Accuracy:")
         st.write(f"Logistic Regression: {model_data['metrics']['log_reg']['accuracy']:.2f}")
         st.write(f"XGBoost: {model_data['metrics']['xgb']['accuracy']:.2f}")
 
+        st.write("### Test Accuracy:")
+        st.write(f"Logistic Regression: {model_data['metrics']['log_reg']['test_accuracy']:.2f}")
+        st.write(f"XGBoost: {model_data['metrics']['xgb']['test_accuracy']:.2f}")
+
         st.write("### Classification Reports:")
         st.text("Logistic Regression:")
         st.text(model_data['metrics']['log_reg']['class_report'])
         st.text("XGBoost:")
         st.text(model_data['metrics']['xgb']['class_report'])
+
+        st.write("### Test Classification Reports:")
+        st.text("Logistic Regression (Test):")
+        st.text(model_data['metrics']['log_reg']['test_class_report'])
+        st.text("XGBoost (Test):")
+        st.text(model_data['metrics']['xgb']['test_class_report'])
 
         # Confusion matrices side-by-side
         fig, axs = plt.subplots(1, 2, figsize=(12, 5))
@@ -431,8 +577,16 @@ if train_button:
         sns.heatmap(model_data['metrics']['xgb']['conf_matrix'], annot=True, fmt='d', ax=axs[1])
         axs[1].set_title("XGBoost Confusion Matrix")
         st.pyplot(fig)
+
+        # Test confusion matrices side-by-side
+        fig_test, axs_test = plt.subplots(1, 2, figsize=(12, 5))
+        sns.heatmap(model_data['metrics']['log_reg']['test_conf_matrix'], annot=True, fmt='d', ax=axs_test[0])
+        axs_test[0].set_title("Logistic Regression Test Confusion Matrix")
+        sns.heatmap(model_data['metrics']['xgb']['test_conf_matrix'], annot=True, fmt='d', ax=axs_test[1])
+        axs_test[1].set_title("XGBoost Test Confusion Matrix")
+        st.pyplot(fig_test)
     else:
-        st.error("Please provide valid local paths for training and validation image folders.")
+        st.error("Please provide valid local paths for training, validation, and test image folders.")
 
 # =======================
 # X-RAY CLASSIFICATION (from v06; uses session_state for model persistence)
@@ -492,6 +646,45 @@ elif dataset_source == "Hacker News (Free)":
     if texts:
         st.success(f"✅ Collected {len(texts)} Hacker News stories.")
         st.session_state.data_collected = True
+
+elif dataset_source == "HealthVer (local CSV)":
+    # Controls for local CSV usage
+    hv_split = st.sidebar.selectbox("HealthVer split (data folder)", ["train", "dev", "test"], index=1)
+    hv_columns_selected = st.sidebar.multiselect(
+        "Columns to analyze",
+        ["claim", "evidence", "question"],
+        default=["claim"]
+    )
+    csv_paths = {
+        "train": os.path.join("data", "healthver_train.csv"),
+        "dev": os.path.join("data", "healthver_dev.csv"),
+        "test": os.path.join("data", "healthver_test.csv"),
+    }
+    csv_path = csv_paths.get(hv_split)
+    if csv_path and os.path.exists(csv_path):
+        try:
+            df_hv = pd.read_csv(csv_path)
+            use_cols = [c for c in hv_columns_selected if c in df_hv.columns]
+            if not use_cols:
+                # Fallback to any available known columns
+                use_cols = [c for c in ["claim", "evidence", "question"] if c in df_hv.columns]
+            if use_cols:
+                # Concatenate selected columns' text
+                texts = []
+                for c in use_cols:
+                    series_text = df_hv[c].dropna().astype(str).tolist()
+                    texts.extend(series_text)
+                if texts:
+                    st.success(f"✅ Loaded {len(texts)} texts from {hv_split} CSV ({', '.join(use_cols)}).")
+                    st.session_state.data_collected = True
+                else:
+                    st.warning("CSV loaded but no text found in selected columns.")
+            else:
+                st.warning("Selected columns not found in CSV. Available columns: " + ", ".join(df_hv.columns.astype(str)))
+        except Exception as e:
+            st.error(f"Failed to read HealthVer CSV: {e}")
+    else:
+        st.error(f"CSV not found at {csv_path}. Ensure the file exists in the 'data' folder.")
 
 elif dataset_source == "HealthVer (local JSON)":
     healthver_file = st.sidebar.file_uploader("Upload HealthVer JSON dataset", type=["json"])
@@ -578,16 +771,6 @@ if texts:
             # Sentiment distribution
             sentiment_scores = [TextBlob(text).sentiment.polarity for text in cleaned_texts]
             
-            # Create sentiment distribution plot
-            fig_sentiment, ax_sentiment = plt.subplots(figsize=(8, 5))
-            sns.histplot(sentiment_scores, bins=20, kde=True, ax=ax_sentiment)
-            ax_sentiment.axvline(0.0, color='red', linestyle='--', alpha=0.7, label='Neutral (0)')
-            ax_sentiment.set_xlabel('Sentiment Polarity (-1 to 1)')
-            ax_sentiment.set_ylabel('Frequency')
-            ax_sentiment.set_title(f'Sentiment Distribution for "{search_query}"')
-            ax_sentiment.legend()
-            st.pyplot(fig_sentiment)
-            
             # Sentiment statistics
             st.markdown("### 📈 Sentiment Statistics")
             col1, col2, col3, col4 = st.columns(4)
@@ -607,142 +790,7 @@ if texts:
                 sentiment_label = "❌ Negative" if sentiment < 0 else "✅ Positive" if sentiment > 0 else "⚪ Neutral"
                 st.write(f"{sentiment_label} ({sentiment:.2f}): {text[:150]}...")
             
-            # Additional visualizations
-            st.markdown("### 📊 Additional Analytics")
-            
-            # 1. Sentiment vs Text Length Scatter Plot
-            text_lengths = [len(text) for text in cleaned_texts]
-            fig_scatter, ax_scatter = plt.subplots(figsize=(10, 6))
-            scatter = ax_scatter.scatter(text_lengths, sentiment_scores, 
-                                       c=sentiment_scores, cmap='RdYlGn', 
-                                       alpha=0.6, s=50)
-            ax_scatter.set_xlabel('Text Length (characters)')
-            ax_scatter.set_ylabel('Sentiment Polarity')
-            ax_scatter.set_title('Text Length vs Sentiment Analysis')
-            ax_scatter.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-            plt.colorbar(scatter, ax=ax_scatter, label='Sentiment Score')
-            st.pyplot(fig_scatter)
-            
-            # 2. Sentiment Categories Bar Chart
-            sentiment_categories = ['Negative', 'Neutral', 'Positive']
-            sentiment_counts = [
-                sum(1 for s in sentiment_scores if s < -0.1),
-                sum(1 for s in sentiment_scores if -0.1 <= s <= 0.1),
-                sum(1 for s in sentiment_scores if s > 0.1)
-            ]
-            
-            fig_bar, ax_bar = plt.subplots(figsize=(8, 6))
-            colors = ['#ff6b6b', '#ffd93d', '#6bcf7f']
-            bars = ax_bar.bar(sentiment_categories, sentiment_counts, color=colors, alpha=0.7)
-            ax_bar.set_xlabel('Sentiment Category')
-            ax_bar.set_ylabel('Number of Texts')
-            ax_bar.set_title('Distribution of Sentiment Categories')
-            
-            # Add value labels on bars
-            for bar, count in zip(bars, sentiment_counts):
-                height = bar.get_height()
-                ax_bar.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                           f'{count}', ha='center', va='bottom', fontweight='bold')
-            st.pyplot(fig_bar)
-            
-            # 3. Text Length Distribution
-            fig_hist, ax_hist = plt.subplots(figsize=(8, 6))
-            ax_hist.hist(text_lengths, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
-            ax_hist.axvline(np.mean(text_lengths), color='red', linestyle='--', 
-                           label=f'Mean: {np.mean(text_lengths):.0f}')
-            ax_hist.axvline(np.median(text_lengths), color='orange', linestyle='--', 
-                           label=f'Median: {np.median(text_lengths):.0f}')
-            ax_hist.set_xlabel('Text Length (characters)')
-            ax_hist.set_ylabel('Frequency')
-            ax_hist.set_title('Distribution of Text Lengths')
-            ax_hist.legend()
-            st.pyplot(fig_hist)
-            
-            # 4. Sentiment Box Plot by Source
-            if hasattr(st.session_state, 'current_source') or 'dataset_source' in locals():
-                source_name = dataset_source.split('(')[0].strip()
-                fig_box, ax_box = plt.subplots(figsize=(6, 8))
-                ax_box.boxplot(sentiment_scores, labels=[source_name])
-                ax_box.set_ylabel('Sentiment Polarity')
-                ax_box.set_title(f'Sentiment Distribution Box Plot\n({source_name})')
-                ax_box.axhline(y=0, color='red', linestyle='--', alpha=0.5)
-                st.pyplot(fig_box)
-            
-            # 5. Interactive Plotly Visualizations (if available)
-            if PLOTLY_AVAILABLE:
-                st.markdown("### 🎮 Interactive Visualizations")
-                
-                # Interactive sentiment vs length scatter
-                df_plot = pd.DataFrame({
-                    'Text_Length': text_lengths,
-                    'Sentiment': sentiment_scores,
-                    'Text_Preview': [text[:100] + '...' for text in cleaned_texts],
-                    'Sentiment_Category': ['Negative' if s < -0.1 else 'Neutral' if s <= 0.1 else 'Positive' 
-                                         for s in sentiment_scores]
-                })
-                
-                fig_interactive = px.scatter(
-                    df_plot, 
-                    x='Text_Length', 
-                    y='Sentiment',
-                    color='Sentiment_Category',
-                    hover_data=['Text_Preview'],
-                    title='Interactive: Text Length vs Sentiment',
-                    color_discrete_map={'Negative': '#ff6b6b', 'Neutral': '#ffd93d', 'Positive': '#6bcf7f'}
-                )
-                fig_interactive.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5)
-                st.plotly_chart(fig_interactive, use_container_width=True)
-                
-                # Interactive sentiment distribution
-                fig_hist_interactive = px.histogram(
-                    df_plot, 
-                    x='Sentiment', 
-                    nbins=20,
-                    title='Interactive Sentiment Distribution',
-                    color_discrete_sequence=['skyblue']
-                )
-                fig_hist_interactive.add_vline(x=0, line_dash="dash", line_color="red", opacity=0.7)
-                st.plotly_chart(fig_hist_interactive, use_container_width=True)
-            
-            # 6. Word Cloud visualization (simplified version using text stats)
-            st.markdown("### 📝 Text Analysis Summary")
-            
-            # Calculate text statistics
-            total_chars = sum(text_lengths)
-            avg_words = np.mean([len(text.split()) for text in cleaned_texts])
-            
-            col_stats1, col_stats2, col_stats3, col_stats4 = st.columns(4)
-            with col_stats1:
-                st.metric("📊 Total Characters", f"{total_chars:,}")
-            with col_stats2:
-                st.metric("📝 Avg Words/Text", f"{avg_words:.1f}")
-            with col_stats3:
-                st.metric("📏 Longest Text", f"{max(text_lengths)} chars")
-            with col_stats4:
-                st.metric("📏 Shortest Text", f"{min(text_lengths)} chars")
-            
-            # Sentiment progression over text samples
-            if len(sentiment_scores) > 5:
-                fig_progression, ax_progression = plt.subplots(figsize=(12, 4))
-                sample_indices = range(min(20, len(sentiment_scores)))
-                sample_sentiments = sentiment_scores[:20]
-                colors = ['red' if s < 0 else 'green' if s > 0 else 'gray' for s in sample_sentiments]
-                
-                bars = ax_progression.bar(sample_indices, sample_sentiments, color=colors, alpha=0.7)
-                ax_progression.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-                ax_progression.set_xlabel('Text Sample Index')
-                ax_progression.set_ylabel('Sentiment Score')
-                ax_progression.set_title('Sentiment Progression Across Text Samples')
-                ax_progression.grid(True, alpha=0.3)
-                
-                # Add trend line
-                if len(sample_sentiments) > 3:
-                    z = np.polyfit(sample_indices, sample_sentiments, 1)
-                    p = np.poly1d(z)
-                    ax_progression.plot(sample_indices, p(sample_indices), "b--", alpha=0.8, linewidth=2, label='Trend')
-                    ax_progression.legend()
-                
-                st.pyplot(fig_progression)
+
 
 else:
     st.info("No text data loaded from selected dataset.")
@@ -785,106 +833,36 @@ if simulate_button:
         ax1.set_ylabel("Care Seeking Behavior")
         st.pyplot(fig1)
     
-    with col2:
-        # 2. Correlation heatmap
-        correlation_data = df_reset[["Symptom Severity", "Care Seeking Behavior", 
-                                   "Trust in Clinician", "Misinformation Exposure"]].corr()
-        fig2, ax2 = plt.subplots(figsize=(8, 6))
-        sns.heatmap(correlation_data, annot=True, cmap='RdBu_r', center=0, 
-                   square=True, ax=ax2, cbar_kws={"shrink": .8})
-        ax2.set_title("Variable Correlations in Simulation")
-        st.pyplot(fig2)
     
-    # 3. Time series analysis
-    st.markdown("### ⏱️ Simulation Trends Over Time")
-    if 'Step' in df_reset.columns:
-        step_col = 'Step'
-    else:
-        step_col = df_reset.columns[1] if len(df_reset.columns) > 2 else df_reset.columns[-1]
-    
-    sim_means = df_reset.groupby(step_col).agg({
-        'Symptom Severity': 'mean',
-        'Care Seeking Behavior': 'mean',
-        'Trust in Clinician': 'mean',
-        'Misinformation Exposure': 'mean'
-    }).reset_index()
-    
-    fig3, ((ax3, ax4), (ax5, ax6)) = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Multiple time series plots
-    ax3.plot(sim_means[step_col], sim_means['Symptom Severity'], 'b-', linewidth=2, marker='o')
-    ax3.set_title('Average Symptom Severity Over Time')
-    ax3.set_xlabel('Step')
-    ax3.set_ylabel('Symptom Severity')
-    ax3.grid(True, alpha=0.3)
-    
-    ax4.plot(sim_means[step_col], sim_means['Care Seeking Behavior'], 'g-', linewidth=2, marker='s')
-    ax4.set_title('Average Care Seeking Behavior Over Time')
-    ax4.set_xlabel('Step')
-    ax4.set_ylabel('Care Seeking Behavior')
-    ax4.grid(True, alpha=0.3)
-    
-    ax5.plot(sim_means[step_col], sim_means['Trust in Clinician'], 'orange', linewidth=2, marker='^')
-    ax5.set_title('Average Trust in Clinician Over Time')
-    ax5.set_xlabel('Step')
-    ax5.set_ylabel('Trust in Clinician')
-    ax5.grid(True, alpha=0.3)
-    
-    ax6.plot(sim_means[step_col], sim_means['Misinformation Exposure'], 'r-', linewidth=2, marker='d')
-    ax6.set_title('Average Misinformation Exposure Over Time')
-    ax6.set_xlabel('Step')
-    ax6.set_ylabel('Misinformation Exposure')
-    ax6.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    st.pyplot(fig3)
-    
-    # 4. Distribution plots
-    st.markdown("### 📊 Distribution Analysis")
-    fig4, ((ax7, ax8), (ax9, ax10)) = plt.subplots(2, 2, figsize=(15, 8))
-    
-    # Histograms for each variable
-    ax7.hist(df_reset['Symptom Severity'], bins=10, alpha=0.7, color='blue', edgecolor='black')
-    ax7.set_title('Distribution of Symptom Severity')
-    ax7.set_xlabel('Symptom Severity')
-    ax7.set_ylabel('Frequency')
-    
-    ax8.hist(df_reset['Care Seeking Behavior'], bins=20, alpha=0.7, color='green', edgecolor='black')
-    ax8.set_title('Distribution of Care Seeking Behavior')
-    ax8.set_xlabel('Care Seeking Behavior')
-    ax8.set_ylabel('Frequency')
-    
-    ax9.hist(df_reset['Trust in Clinician'], bins=20, alpha=0.7, color='orange', edgecolor='black')
-    ax9.set_title('Distribution of Trust in Clinician')
-    ax9.set_xlabel('Trust in Clinician')
-    ax9.set_ylabel('Frequency')
-    
-    ax10.hist(df_reset['Misinformation Exposure'], bins=20, alpha=0.7, color='red', edgecolor='black')
-    ax10.set_title('Distribution of Misinformation Exposure')
-    ax10.set_xlabel('Misinformation Exposure')
-    ax10.set_ylabel('Frequency')
-    
-    plt.tight_layout()
-    st.pyplot(fig4)
-    
-    # 5. 3D Scatter Plot (if enough data points)
+    # 3. 2D Scatter Plot (converted from 3D)
     if len(df_reset) > 10:
-        st.markdown("### 🎯 3D Relationship Analysis")
-        fig5 = plt.figure(figsize=(10, 8))
-        ax_3d = fig5.add_subplot(111, projection='3d')
-        scatter_3d = ax_3d.scatter(df_reset['Symptom Severity'], 
-                                  df_reset['Care Seeking Behavior'],
-                                  df_reset['Trust in Clinician'],
-                                  c=df_reset['Misinformation Exposure'],
-                                  cmap='viridis', alpha=0.6, s=50)
-        ax_3d.set_xlabel('Symptom Severity')
-        ax_3d.set_ylabel('Care Seeking Behavior')
-        ax_3d.set_zlabel('Trust in Clinician')
-        ax_3d.set_title('3D Relationship: Symptoms, Care-Seeking & Trust\n(Color = Misinformation Level)')
-        plt.colorbar(scatter_3d, label='Misinformation Exposure', shrink=0.8)
-        st.pyplot(fig5)
+        st.markdown("### 🎯 2D Relationship Analysis")
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # First 2D plot: Symptom Severity vs Care Seeking Behavior
+        scatter1 = ax3a.scatter(df_reset['Symptom Severity'], 
+                               df_reset['Care Seeking Behavior'],
+                               c=df_reset['Misinformation Exposure'],
+                               cmap='viridis', alpha=0.6, s=50)
+        ax3a.set_xlabel('Symptom Severity')
+        ax3a.set_ylabel('Care Seeking Behavior')
+        ax3a.set_title('Symptoms vs Care-Seeking\n(Color = Misinformation Level)')
+        plt.colorbar(scatter1, ax=ax3a, label='Misinformation Exposure', shrink=0.8)
+        
+        # Second 2D plot: Trust vs Care Seeking Behavior
+        scatter2 = ax3b.scatter(df_reset['Trust in Clinician'], 
+                               df_reset['Care Seeking Behavior'],
+                               c=df_reset['Misinformation Exposure'],
+                               cmap='viridis', alpha=0.6, s=50)
+        ax3b.set_xlabel('Trust in Clinician')
+        ax3b.set_ylabel('Care Seeking Behavior')
+        ax3b.set_title('Trust vs Care-Seeking\n(Color = Misinformation Level)')
+        plt.colorbar(scatter2, ax=ax3b, label='Misinformation Exposure', shrink=0.8)
+        
+        plt.tight_layout()
+        st.pyplot(fig3)
     
-    # 6. Summary statistics table
+    # 4. Summary statistics table
     st.markdown("### 📋 Simulation Summary Statistics")
     summary_stats = df_reset[["Symptom Severity", "Care Seeking Behavior", 
                              "Trust in Clinician", "Misinformation Exposure"]].describe()
@@ -905,4 +883,3 @@ st.markdown(
     - Advanced visualizations: sentiment distributions, misinformation rates, and simulation trends
     """
 )
-
