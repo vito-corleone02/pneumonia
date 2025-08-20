@@ -153,6 +153,7 @@ Werkzeug
 widgetsnbextension
 wrapt
 xgboost
+kaggle
 
 
 
